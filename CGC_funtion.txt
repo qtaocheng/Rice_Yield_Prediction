@@ -1,0 +1,515 @@
+// ==================================================================================
+// 修改本地的GPP数据和系数
+// ==================================================================================
+
+// 研究区
+var ROI = createSimulatedROI();
+var datapt = createSimulatedDataPoints();
+var AOI = ee.Feature(ee.Geometry.Point([118.15, 33.85]), {label: 'Study_Area'});
+
+// ============================= 界面设计 =====================================
+// 创建主控制面板
+var controlPanel = ui.Panel({
+  layout: ui.Panel.Layout.flow('vertical'),
+  style: {
+    width: '350px',
+    padding: '20px',
+    backgroundColor: '#f8f9fa',
+    border: '2px solid #dee2e6',
+    borderRadius: '10px'
+  }
+});
+
+// 标题
+var title = ui.Label({
+  value: '🌾 GPP-产量预测分析工具',
+  style: {
+    fontSize: '20px',
+    fontWeight: 'bold',
+    color: '#2d5a27',
+    textAlign: 'center',
+    margin: '0 0 20px 0'
+  }
+});
+
+// 参数控制区域
+var parameterSection = ui.Panel({
+  layout: ui.Panel.Layout.flow('vertical'),
+  style: {margin: '10px 0', padding: '10px', backgroundColor: '#e9ecef', borderRadius: '5px'}
+});
+
+var paramTitle = ui.Label({
+  value: '⚙️ 模型参数设置',
+  style: {fontSize: '14px', fontWeight: 'bold', color: '#495057'}
+});
+
+// 数据模糊开关
+var blurCheckbox = ui.Checkbox({
+  label: '启用数据模糊处理',
+  value: CONFIG.blur.enabled,
+  style: {margin: '5px 0'}
+});
+
+// GPP噪声系数滑块
+var gppNoiseSlider = ui.Slider({
+  min: 0,
+  max: 0.5,
+  value: CONFIG.blur.gppNoiseFactor,
+  step: 0.01,
+  style: {width: '250px', margin: '5px 0'}
+});
+var gppNoiseLabel = ui.Label('GPP噪声系数: ' + CONFIG.blur.gppNoiseFactor);
+
+// 产量噪声系数滑块
+var yieldNoiseSlider = ui.Slider({
+  min: 0,
+  max: 0.2,
+  value: CONFIG.blur.yieldNoiseFactor,
+  step: 0.005,
+  style: {width: '250px', margin: '5px 0'}
+});
+var yieldNoiseLabel = ui.Label('产量噪声系数: ' + CONFIG.blur.yieldNoiseFactor);
+
+// 年份选择
+var yearSelect = ui.Select({
+  items: ['2019', '2020', '2021', '2022'],
+  value: '2022',
+  placeholder: '选择分析年份',
+  style: {width: '150px', margin: '5px 0'}
+});
+
+// 分析区域选择  
+var regionSelect = ui.Select({
+  items: ['研究区1', '研究区2', '研究区3', '全区域'],
+  value: '全区域',
+  placeholder: '选择分析区域',
+  style: {width: '150px', margin: '5px 0'}
+});
+
+// 执行按钮
+var runButton = ui.Button({
+  label: '🚀 开始分析',
+  style: {
+    backgroundColor: '#28a745',
+    color: 'white',
+    fontWeight: 'bold',
+    fontSize: '14px',
+    margin: '15px 0 10px 0',
+    width: '200px'
+  }
+});
+
+var exportButton = ui.Button({
+  label: '📥 导出结果',
+  style: {
+    backgroundColor: '#007bff',
+    color: 'white',
+    fontWeight: 'bold',
+    fontSize: '14px',
+    margin: '5px 0',
+    width: '200px'
+  }
+});
+
+// 状态显示
+var statusLabel = ui.Label({
+  value: '📊 状态: 就绪',
+  style: {
+    fontSize: '12px',
+    color: '#6c757d',
+    margin: '10px 0'
+  }
+});
+
+// 进度条
+var progressBar = ui.Panel({
+  style: {
+    height: '20px',
+    backgroundColor: '#e9ecef',
+    border: '1px solid #ced4da',
+    borderRadius: '10px',
+    margin: '10px 0'
+  }
+});
+
+// ============================= 数据模糊函数 =====================================
+/**
+ * 对影像添加随机噪声进行模糊处理
+ */
+var addImageNoise = function(image, noiseFactor) {
+  if (!CONFIG.blur.enabled) return image;
+  
+  var noise = ee.Image.random().subtract(0.5).multiply(noiseFactor * 2);
+  var bounds = image.geometry();
+  noise = noise.clip(bounds);
+  
+  return image.add(noise.multiply(image.abs().multiply(0.1)));
+};
+
+/**
+ * 对时间序列进行平滑处理
+ */
+var temporalSmoothing = function(collection, windowSize) {
+  if (!CONFIG.blur.enabled) return collection;
+  
+  var smoothed = collection.map(function(image) {
+    var date = ee.Date(image.get('system:time_start'));
+    var window = collection.filterDate(
+      date.advance(-windowSize, 'day'),
+      date.advance(windowSize, 'day')
+    );
+    return window.mean()
+      .set('system:time_start', image.get('system:time_start'))
+      .copyProperties(image, ['system:time_start']);
+  });
+  
+  return smoothed;
+};
+
+// ============================= 核心处理函数 =====================================
+/**
+ * 获取模糊处理后的作物掩膜
+ */
+var getCropMask = function() {
+  // 使用模拟的作物分类数据
+  var simulatedCropland = ee.Image.random().multiply(100).toInt()
+    .remap([0, 20, 40, 60, 80, 100], [10, 20, 40, 50, 60, 70])
+    .clip(ROI);
+  
+  var cropMask = simulatedCropland.eq(40); // 假设40为作物类型
+  if (CONFIG.blur.enabled) {
+    // 添加形态学操作进行模糊
+    cropMask = cropMask.focal_mode(30, 'circle', 'meters');
+  }
+  
+  return cropMask;
+};
+
+/**
+ * 模糊的GPP计算模块（替代敏感的真实算法）
+ */
+var calculateBlurredGPP = function(startDate, endDate, params, region) {
+  // 生成模拟的GPP时间序列
+  var dates = ee.List.sequence(0, 180, 5).map(function(day) {
+    return ee.Date(startDate).advance(day, 'day');
+  });
+  
+  var gppCollection = ee.ImageCollection.fromImages(
+    dates.map(function(date) {
+      var dayOfYear = ee.Date(date).getRelative('day', 'year');
+      
+      // 模拟季节性GPP变化（正弦波 + 随机噪声）
+      var seasonalGPP = ee.Image.constant(dayOfYear).divide(365)
+        .multiply(2).multiply(Math.PI).sin()
+        .add(1).multiply(params[0]).add(params[1]);
+      
+      // 添加空间变异性
+      var spatialVariation = ee.Image.random().subtract(0.5).multiply(2);
+      var gpp = seasonalGPP.add(spatialVariation).max(0);
+      
+      // 数据模糊处理
+      if (CONFIG.blur.enabled) {
+        gpp = addImageNoise(gpp, CONFIG.blur.gppNoiseFactor);
+        gpp = gpp.focal_mean(CONFIG.blur.spatialSmooth, 'circle', 'meters');
+      }
+      
+      return gpp.rename('GPP')
+        .set('system:time_start', ee.Date(date).millis())
+        .set('doy', dayOfYear)
+        .clip(region);
+    })
+  );
+  
+  return gppCollection;
+};
+
+/**
+ * 谐波分析函数（简化版本）
+ */
+var harmonicAnalysis = function(gppCollection) {
+  statusLabel.setValue('📈 正在进行谐波分析...');
+  
+  var addHarmonics = function(image) {
+    var timeRadians = ee.Image.constant(2).multiply(Math.PI)
+      .multiply(image.date().getRelative('day', 'year')).divide(365);
+    
+    return image
+      .addBands(timeRadians.cos().rename('cos'))
+      .addBands(timeRadians.sin().rename('sin'))
+      .addBands(ee.Image.constant(1).rename('constant'));
+  };
+  
+  var harmonicCollection = gppCollection.map(addHarmonics);
+  
+  var harmonicTrend = harmonicCollection
+    .select(['constant', 'cos', 'sin', 'GPP'])
+    .reduce(ee.Reducer.linearRegression(3, 1));
+  
+  var coefficients = harmonicTrend.select('coefficients')
+    .arrayProject([0])
+    .arrayFlatten([['constant', 'cos', 'sin']]);
+  
+  var fittedCollection = harmonicCollection.map(function(image) {
+    var fitted = image.select(['constant', 'cos', 'sin'])
+      .multiply(coefficients)
+      .reduce('sum');
+    return image.addBands(fitted.rename('fitted'));
+  });
+  
+  return {
+    collection: fittedCollection,
+    coefficients: coefficients
+  };
+};
+
+/**
+ * 产量预测函数
+ */
+var predictYield = function(gppResult, coeffs) {
+  statusLabel.setValue('🌾 正在预测产量...');
+  
+  // 计算累积GPP
+  var cumulativeGPP = gppResult.collection.select('fitted').sum();
+  
+  // 数据模糊处理
+  if (CONFIG.blur.enabled) {
+    cumulativeGPP = addImageNoise(cumulativeGPP, CONFIG.blur.yieldNoiseFactor);
+  }
+  
+  // 应用模糊的产量模型
+  var yield = cumulativeGPP
+    .multiply(CONFIG.model.yieldCoeff[0])
+    .add(CONFIG.model.yieldCoeff[1]);
+  
+  return yield.max(0).rename('predicted_yield');
+};
+
+// ============================= 主处理流程 =====================================
+var mainAnalysis = function() {
+  try {
+    statusLabel.setValue('🔄 开始处理...');
+    updateProgress(20);
+    
+    var selectedYear = yearSelect.getValue();
+    var startDate = selectedYear + '-01-01';
+    var endDate = (parseInt(selectedYear) + 1) + '-01-01';
+    
+    // 获取作物掩膜
+    var cropMask = getCropMask();
+    updateProgress(40);
+    
+    // 计算模糊GPP
+    var gppParams = selectedYear === '2022' ? 
+      CONFIG.model.gppParams2022 : CONFIG.model.gppParams2021;
+    var gppCollection = calculateBlurredGPP(startDate, endDate, gppParams, ROI);
+    updateProgress(60);
+    
+    // 谐波分析
+    var harmonicResult = harmonicAnalysis(gppCollection);
+    updateProgress(80);
+    
+    // 产量预测
+    var predictedYield = predictYield(harmonicResult, harmonicResult.coefficients);
+    updateProgress(100);
+    
+    // 应用作物掩膜
+    var maskedYield = predictedYield.updateMask(cropMask);
+    
+    // 可视化参数
+    var yieldVis = {
+      min: 3,
+      max: 12,
+      palette: ['#d73027', '#f46d43', '#fdae61', '#fee08b', '#e6f598', 
+                '#abdda4', '#66c2a5', '#3288bd', '#5e4fa2']
+    };
+    
+    var gppVis = {
+      min: 0,
+      max: 50,
+      palette: ['#ffffff', '#f7fcb9', '#d9f0a3', '#addd8e', '#78c679',
+                '#41ab5d', '#238443', '#005a32']
+    };
+    
+    // 添加图层到地图
+    Map.layers().reset();
+    Map.addLayer(ROI, {color: 'black', fillColor: '00000000'}, '研究区边界');
+    Map.addLayer(maskedYield, yieldVis, '预测产量 (t/ha)');
+    Map.addLayer(harmonicResult.collection.select('fitted').max(), gppVis, '最大GPP');
+    Map.addLayer(cropMask.selfMask(), {palette: ['green']}, '作物区域');
+    Map.addLayer(AOI, {color: 'red', pointSize: 8}, '研究点');
+    
+    // 设置地图中心
+    Map.centerObject(ROI, 10);
+    
+    statusLabel.setValue('✅ 分析完成！');
+    
+    // 存储结果用于导出
+    window.analysisResults = {
+      yield: maskedYield,
+      gpp: harmonicResult.collection.select('fitted').max(),
+      region: ROI,
+      year: selectedYear
+    };
+    
+  } catch (error) {
+    statusLabel.setValue('❌ 错误: ' + error.message);
+    print('分析错误:', error);
+  }
+};
+
+// ============================= 辅助函数 =====================================
+var updateProgress = function(percentage) {
+  progressBar.clear();
+  var filled = ui.Panel({
+    style: {
+      width: percentage + '%',
+      height: '18px',
+      backgroundColor: '#28a745',
+      borderRadius: '9px',
+      margin: '1px'
+    }
+  });
+  progressBar.add(filled);
+};
+
+var exportResults = function() {
+  if (!window.analysisResults) {
+    statusLabel.setValue('❌ 请先运行分析');
+    return;
+  }
+  
+  try {
+    var results = window.analysisResults;
+    
+    // 导出产量预测结果
+    Export.image.toDrive({
+      image: results.yield.multiply(100).toUint16(),
+      description: 'Yield_Prediction_' + results.year,
+      folder: 'GPP_Yield_Analysis',
+      region: results.region,
+      scale: 30,
+      maxPixels: 1e13,
+      crs: 'EPSG:4326'
+    });
+    
+    // 导出点数据
+    var pointData = results.yield.reduceRegions({
+      collection: datapt,
+      reducer: ee.Reducer.mean(),
+      scale: 30,
+      crs: 'EPSG:4326'
+    });
+    
+    Export.table.toDrive({
+      collection: pointData,
+      description: 'Point_Yield_Data_' + results.year,
+      folder: 'GPP_Yield_Analysis',
+      fileFormat: 'CSV'
+    });
+    
+    statusLabel.setValue('📤 导出任务已提交');
+    
+  } catch (error) {
+    statusLabel.setValue('❌ 导出错误: ' + error.message);
+  }
+};
+
+// ============================= 事件处理 =====================================
+// 滑块值变化事件
+gppNoiseSlider.onChange(function(value) {
+  CONFIG.blur.gppNoiseFactor = value;
+  gppNoiseLabel.setValue('GPP噪声系数: ' + value.toFixed(3));
+});
+
+yieldNoiseSlider.onChange(function(value) {
+  CONFIG.blur.yieldNoiseFactor = value;
+  yieldNoiseLabel.setValue('产量噪声系数: ' + value.toFixed(3));
+});
+
+// 模糊开关事件
+blurCheckbox.onChange(function(checked) {
+  CONFIG.blur.enabled = checked;
+  statusLabel.setValue(checked ? '🔀 数据模糊已启用' : '🔒 数据模糊已禁用');
+});
+
+// 按钮点击事件
+runButton.onClick(mainAnalysis);
+exportButton.onClick(exportResults);
+
+// ============================= 界面组装 =====================================
+controlPanel.add(title);
+controlPanel.add(ui.Label('选择分析参数:', {fontWeight: 'bold', margin: '10px 0 5px 0'}));
+controlPanel.add(ui.Panel([ui.Label('年份:', {width: '60px'}), yearSelect], ui.Panel.Layout.flow('horizontal')));
+controlPanel.add(ui.Panel([ui.Label('区域:', {width: '60px'}), regionSelect], ui.Panel.Layout.flow('horizontal')));
+
+parameterSection.add(paramTitle);
+parameterSection.add(blurCheckbox);
+parameterSection.add(ui.Panel([ui.Label('GPP噪声:', {width: '80px'}), gppNoiseSlider], ui.Panel.Layout.flow('horizontal')));
+parameterSection.add(gppNoiseLabel);
+parameterSection.add(ui.Panel([ui.Label('产量噪声:', {width: '80px'}), yieldNoiseSlider], ui.Panel.Layout.flow('horizontal')));
+parameterSection.add(yieldNoiseLabel);
+
+controlPanel.add(parameterSection);
+controlPanel.add(ui.Panel([runButton, exportButton], ui.Panel.Layout.flow('horizontal')));
+controlPanel.add(statusLabel);
+controlPanel.add(progressBar);
+
+// 添加帮助信息
+var helpPanel = ui.Panel({
+  layout: ui.Panel.Layout.flow('vertical'),
+  style: {margin: '20px 0', padding: '10px', backgroundColor: '#f8f9fa', borderRadius: '5px'}
+});
+
+helpPanel.add(ui.Label('📖 使用说明:', {fontWeight: 'bold', fontSize: '12px'}));
+helpPanel.add(ui.Label('1. 选择分析年份和区域', {fontSize: '11px', margin: '2px 0'}));
+helpPanel.add(ui.Label('2. 调整数据模糊参数', {fontSize: '11px', margin: '2px 0'}));
+helpPanel.add(ui.Label('3. 点击"开始分析"运行模型', {fontSize: '11px', margin: '2px 0'}));
+helpPanel.add(ui.Label('4. 分析完成后可导出结果', {fontSize: '11px', margin: '2px 0'}));
+
+controlPanel.add(helpPanel);
+
+// ============================= 初始化界面 =====================================
+// 清空原有界面并添加新界面
+ui.root.clear();
+ui.root.add(controlPanel);
+
+// 设置地图选项
+Map.setOptions('SATELLITE');
+Map.centerObject(AOI, 12);
+Map.addLayer(ROI, {color: 'red', fillColor: '00000000'}, '研究区边界');
+Map.addLayer(AOI, {color: 'yellow', pointSize: 10}, '研究中心点');
+
+// 初始状态
+statusLabel.setValue('🎯 界面已加载，请配置参数后开始分析');
+updateProgress(0);
+
+// ============================= 添加图例 =====================================
+var createLegend = function() {
+  var legend = ui.Panel({
+    style: {
+      position: 'bottom-left',
+      padding: '8px 15px',
+      backgroundColor: 'rgba(255,255,255,0.9)',
+      borderRadius: '5px'
+    }
+  });
+  
+  var legendTitle = ui.Label({
+    value: '图例',
+    style: {fontWeight: 'bold', fontSize: '14px', margin: '0 0 5px 0'}
+  });
+  
+  legend.add(legendTitle);
+  legend.add(ui.Label('🟢 作物区域', {fontSize: '12px', margin: '2px 0'}));
+  legend.add(ui.Label('🔴 研究边界', {fontSize: '12px', margin: '2px 0'}));
+  legend.add(ui.Label('🟡 研究中心', {fontSize: '12px', margin: '2px 0'}));
+  
+  return legend;
+};
+
+// 在地图上添加图例
+Map.add(createLegend());
+
+print('🚀 GPP-产量预测分析工具已启动');
+print('🔧 版本特色: 数据隐私保护、交互式界面、模糊处理算法');
+print('💡 提示: 使用左侧控制面板进行分析参数配置');
